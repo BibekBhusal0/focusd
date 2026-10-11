@@ -37,6 +37,7 @@ pub fn check_peer(stream: &UnixStream) -> Result<()> {
   Ok(())
 }
 
+#[cfg(target_os = "linux")]
 fn peer_uid(stream: &UnixStream) -> Result<u32> {
   use std::os::unix::io::AsRawFd;
   let mut cred: libc::ucred = unsafe { std::mem::zeroed() };
@@ -54,6 +55,18 @@ fn peer_uid(stream: &UnixStream) -> Result<u32> {
     return Err(Error::last_os_error());
   }
   Ok(cred.uid)
+}
+
+#[cfg(not(target_os = "linux"))]
+fn peer_uid(stream: &UnixStream) -> Result<u32> {
+  use std::os::unix::io::AsRawFd;
+  let mut uid: libc::uid_t = 0;
+  let mut gid: libc::gid_t = 0;
+  let ret = unsafe { libc::getpeereid(stream.as_raw_fd(), &mut uid, &mut gid) };
+  if ret != 0 {
+    return Err(Error::last_os_error());
+  }
+  Ok(uid as u32)
 }
 
 /// One capped line; overlong input and timeouts are errors.
