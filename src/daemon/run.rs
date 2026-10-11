@@ -1,6 +1,6 @@
 use crate::{
   daemon::{
-    commands::{Message, handle_stream},
+    commands::{Message, check_peer, handle_stream, own_uid, read_bounded_line, CLIENT_READ_TIMEOUT, MAX_LINE_BYTES},
     socket_path,
   },
   throw,
@@ -8,11 +8,15 @@ use crate::{
     engine::{decrease_sec, render_time},
     state::TimerState,
   },
+  utils::profile::Profile,
 };
 use std::{
   fs,
-  io::{BufRead, BufReader, Result, Write},
-  os::unix::net::{UnixListener, UnixStream},
+  io::{BufReader, Result},
+  os::unix::{
+    fs::{DirBuilderExt, MetadataExt},
+    net::{UnixListener, UnixStream},
+  },
   path::Path,
   process::{self, Command, Stdio},
   sync::{Arc, Mutex},
@@ -24,16 +28,29 @@ use std::{
 ///
 /// Sends message to daemon to check if it's running
 pub fn daemon_active() -> bool {
-  match UnixStream::connect(socket_path()) {
-    Ok(mut stream) => {
-      let cmd = Message::Running.to_string();
-      stream.write_all(format!("{cmd}\n").as_bytes()).ok();
-      let mut reader = BufReader::new(stream);
-      let mut line = String::new();
-      reader.read_line(&mut line).is_ok() && line.starts_with("YES")
-    }
+  let mut stream = match UnixStream::connect(socket_path()) {
+    Ok(s) => s,
+    Err(_) => return false,
+  };
+  if check_peer(&stream).is_err() {
+    return false;
+  }
+  if stream.set_read_timeout(Some(CLIENT_READ_TIMEOUT)).is_err() {
+    return false;
+  }
+  if write_running(&mut stream).is_err() {
+    return false;
+  }
+  let mut reader = BufReader::new(stream);
+  match read_bounded_line(&mut reader, MAX_LINE_BYTES) {
+    Ok(line) => line.starts_with("YES"),
     Err(_) => false,
   }
+}
+
+fn write_running(stream: &mut UnixStream) -> Result<()> {
+  use std::io::Write;
+  stream.write_all(format!("{}\n", Message::Running).as_bytes())
 }
 
 /// Make sure daemon is running
@@ -64,14 +81,17 @@ pub fn ensure_daemon_active(first_try: bool) -> Result<()> {
   throw!("Daemon not active")
 }
 
-/// Stop daemon if running
-///
-/// Sends message in socket to kindly stop the daemon
+/// Stop daemon if running. Removes only our own socket file.
 pub fn stop_daemon() {
   println!("Stopping the daemon");
   let sp = socket_path();
-  if Path::new(sp).exists() {
-    let _ = fs::remove_file(sp);
+  if Path::new(&sp).exists() {
+    let ours = fs::metadata(&sp)
+      .map(|m| m.uid() == own_uid())
+      .unwrap_or(false);
+    if ours {
+      let _ = fs::remove_file(&sp);
+    }
   }
   process::exit(0);
 }
@@ -87,12 +107,41 @@ pub fn run_daemon() {
   }
   // Delete the socket path if already exists
   let sp = socket_path();
-  if Path::new(sp).exists() {
+  if let Some(dir) = Profile::current().runtime_dir() {
+    if let Err(e) = fs::DirBuilder::new()
+      .recursive(true)
+      .mode(0o700)
+      .create(&dir)
+    {
+      eprintln!("Cannot create runtime dir {}: {e}", dir.display());
+      process::exit(1);
+    }
+  }
+  if Path::new(&sp).exists() {
+    let ours = fs::metadata(&sp)
+      .map(|m| m.uid() == own_uid())
+      .unwrap_or(false);
+    if !ours {
+      eprintln!(
+        "Socket {} is owned by another user; refusing to replace it",
+        sp.display()
+      );
+      process::exit(1);
+    }
     println!("Socket already available removing it");
-    let _ = fs::remove_file(sp);
+    if let Err(e) = fs::remove_file(&sp) {
+      eprintln!("Cannot remove socket {}: {e}", sp.display());
+      process::exit(1);
+    }
   }
 
-  let listener = UnixListener::bind(sp).unwrap();
+  let listener = match UnixListener::bind(&sp) {
+    Ok(l) => l,
+    Err(e) => {
+      eprintln!("Cannot bind socket {}: {e}", sp.display());
+      process::exit(1);
+    }
+  };
   let timer_state = Arc::new(Mutex::new(TimerState::default()));
 
   let s = Arc::clone(&timer_state);

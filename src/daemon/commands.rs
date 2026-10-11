@@ -12,11 +12,71 @@ use crate::{
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
 use std::{
-  io::{BufRead, BufReader, Result, Write},
+  io::{BufRead, BufReader, Error, ErrorKind, Result, Write},
   os::unix::net::UnixStream,
   sync::{Arc, Mutex},
   time::Duration,
 };
+
+pub const MAX_LINE_BYTES: usize = 65536;
+pub const CLIENT_READ_TIMEOUT: Duration = Duration::from_secs(5);
+pub const DAEMON_READ_TIMEOUT: Duration = Duration::from_secs(30);
+
+pub fn own_uid() -> u32 {
+  unsafe { libc::getuid() }
+}
+
+/// Reject peers running as another user.
+pub fn check_peer(stream: &UnixStream) -> Result<()> {
+  if peer_uid(stream)? != own_uid() {
+    return Err(Error::new(
+      ErrorKind::PermissionDenied,
+      "socket peer is not the current user",
+    ));
+  }
+  Ok(())
+}
+
+fn peer_uid(stream: &UnixStream) -> Result<u32> {
+  use std::os::unix::io::AsRawFd;
+  let mut cred: libc::ucred = unsafe { std::mem::zeroed() };
+  let mut len = std::mem::size_of::<libc::ucred>() as libc::socklen_t;
+  let ret = unsafe {
+    libc::getsockopt(
+      stream.as_raw_fd(),
+      libc::SOL_SOCKET,
+      libc::SO_PEERCRED,
+      &mut cred as *mut _ as *mut libc::c_void,
+      &mut len,
+    )
+  };
+  if ret != 0 {
+    return Err(Error::last_os_error());
+  }
+  Ok(cred.uid)
+}
+
+/// One capped line; overlong input and timeouts are errors.
+pub fn read_bounded_line(reader: &mut impl BufRead, cap: usize) -> Result<String> {
+  let mut buf = Vec::new();
+  let mut byte = [0u8; 1];
+  loop {
+    match reader.read(&mut byte) {
+      Ok(0) => break,
+      Ok(_) => {
+        if buf.len() >= cap {
+          return Err(Error::new(ErrorKind::InvalidData, "response too long"));
+        }
+        buf.push(byte[0]);
+        if byte[0] == b'\n' {
+          break;
+        }
+      }
+      Err(e) => return Err(e),
+    }
+  }
+  String::from_utf8(buf).map_err(|_| Error::new(ErrorKind::InvalidData, "response not utf-8"))
+}
 
 #[derive(PartialEq)]
 pub enum Message {
@@ -121,9 +181,10 @@ pub fn contains_payload(message: &str) -> bool {
 }
 
 pub fn handle_stream(mut stream: UnixStream, state: Arc<Mutex<TimerState>>) -> Result<()> {
+  check_peer(&stream)?;
+  stream.set_read_timeout(Some(DAEMON_READ_TIMEOUT))?;
   let mut reader = BufReader::new(stream.try_clone()?);
-  let mut line = String::new();
-  reader.read_line(&mut line)?;
+  let line = read_bounded_line(&mut reader, MAX_LINE_BYTES)?;
 
   let mut s = state
     .lock()
@@ -217,11 +278,11 @@ pub fn handle_stream(mut stream: UnixStream, state: Arc<Mutex<TimerState>>) -> R
 
 pub fn send_command(command: String) -> Result<String> {
   let mut stream = UnixStream::connect(socket_path())?;
+  check_peer(&stream)?;
+  stream.set_read_timeout(Some(CLIENT_READ_TIMEOUT))?;
   stream.write_all(format!("{}\n", command).as_bytes())?;
   let mut reader = BufReader::new(stream);
-  let mut line = String::new();
-  reader.read_line(&mut line)?;
-  Ok(line)
+  read_bounded_line(&mut reader, MAX_LINE_BYTES)
 }
 
 pub fn get_timer_state() -> Result<TimerState> {

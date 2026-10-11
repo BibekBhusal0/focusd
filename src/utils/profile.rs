@@ -22,11 +22,27 @@ impl Profile {
     }
   }
 
-  pub fn socket_path(self) -> &'static str {
+  pub fn tag(self) -> &'static str {
     match self {
-      Self::Dev => "/tmp/focusd-dev.sock",
-      Self::Prod => "/tmp/focusd.sock",
+      Self::Dev => "focusd-dev",
+      Self::Prod => "focusd",
     }
+  }
+
+  /// Per-user socket path; never shared between users.
+  pub fn socket_path(self) -> PathBuf {
+    let name = format!("{}.sock", self.tag());
+    if let Some(dir) = env::var_os("XDG_RUNTIME_DIR").map(PathBuf::from) {
+      return dir.join(self.tag()).join(name);
+    }
+    PathBuf::from(format!("/tmp/{}-{}.sock", self.tag(), unsafe {
+      libc::getuid()
+    }))
+  }
+
+  /// Socket directory. None with the /tmp fallback.
+  pub fn runtime_dir(self) -> Option<PathBuf> {
+    env::var_os("XDG_RUNTIME_DIR").map(|dir| PathBuf::from(dir).join(self.tag()))
   }
 
   pub fn db_path(self) -> PathBuf {
